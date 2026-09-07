@@ -1,0 +1,130 @@
+syntax = "proto3";
+
+package robot.inference.v1;
+// Gateway -> Model Server 的统一推理服务。
+// 一次 Unary RPC 对应一次 observation 推理。
+service ModelInference {
+  rpc Infer(InferenceRequest) returns (InferenceResponse);
+}
+
+
+service ModelRegistry{
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+// 通用数据类型。
+enum DataType {
+  DATA_TYPE_UNSPECIFIED = 0;
+  DATA_TYPE_UINT8 = 1;
+  DATA_TYPE_INT32 = 2;
+  DATA_TYPE_INT64 = 3;
+  DATA_TYPE_FLOAT16 = 4;
+  DATA_TYPE_BFLOAT16 = 5;
+  DATA_TYPE_FLOAT32 = 6;
+  DATA_TYPE_FLOAT64 = 7;
+  DATA_TYPE_BOOL = 8;
+}
+// 图像数据的编码方式。
+enum ImageEncoding {
+  IMAGE_ENCODING_UNSPECIFIED = 0;
+  // 未压缩像素数据，shape、dtype 和 layout 必须有效。
+  IMAGE_ENCODING_RAW = 1;
+  // JPEG/PNG 的 data 保存完整压缩文件内容。
+  IMAGE_ENCODING_JPEG = 2;
+  IMAGE_ENCODING_PNG = 3;
+}
+// 未压缩图像的维度排列。
+enum ImageLayout {
+  IMAGE_LAYOUT_UNSPECIFIED = 0;
+  IMAGE_LAYOUT_HWC = 1;
+  IMAGE_LAYOUT_CHW = 2;
+}
+// 通用连续 Tensor。
+//
+// data 按 C-order（row-major）连续存储。
+// 多字节数值使用 little-endian。
+// data 字节数必须与 shape 和 dtype 一致。
+message Tensor {
+  bytes data = 1;
+  repeated uint64 shape = 2;
+  DataType dtype = 3;
+}
+// 单个相机的图像。
+message Image {
+  // 相机或图像名称，例如 "front"、"wrist"。
+  string name = 1;
+  // RAW 像素，或者完整的 JPEG/PNG 文件内容。
+  bytes data = 2;
+  // RAW 图像必须提供完整 shape，例如 [480, 640, 3]。
+  // 压缩图像可以提供解码后的预期 shape，也可以留空。
+  repeated uint64 shape = 3;
+  // RAW 图像必须指定；压缩图像通常为 UINT8。
+  DataType dtype = 4;
+  ImageEncoding encoding = 5;
+  // RAW 图像必须指定；压缩图像可由 Model Server 解码后确定。
+  ImageLayout layout = 6;
+}
+// 一次模型推理请求。
+message InferenceRequest {
+  // Gateway 生成的唯一标识。
+  // Model Server 必须在响应中原样返回。
+  string request_id = 1;
+  // observation 在机器人端采集完成时的 Unix 纳秒时间戳。
+  int64 timestamp_ns = 2;
+  // 首版只发送一张图像，使用 repeated 为未来多相机保留兼容性。
+  repeated Image images = 3;
+  // 机器人状态的通用一维 Tensor。
+  // 各维含义和排列顺序由 Client Adapter 与模型配置共同约定。
+  Tensor robot_state = 4;
+  // 原始自然语言任务指令。
+  // Tokenization 由 Model Server 完成。
+  string instruction = 5;
+  // 期望返回的动作数量。
+  // 0 表示使用模型默认 action horizon。
+  uint32 requested_action_horizon = 6;
+  // 可选 JSON 对象，用于尚未稳定、且接收端可以忽略的扩展参数。
+  string extensions_json = 7;
+}
+// 一次模型推理响应。
+message InferenceResponse {
+  // 必须与对应请求的 request_id 相同。
+  string request_id = 1;
+  // 模型输出的通用动作 Tensor，通常为 [T, D]：
+  // T 为动作数量，D 为每个动作的维度。
+  // 首版不在协议中规定各维的业务语义。
+  Tensor actions = 2;
+  // 仅统计 Model Server 内部的模型推理时间，不包括 gRPC 传输。
+  uint64 inference_time_us = 3;
+  // 可选 JSON 对象，用于尚未稳定、且接收端可以忽略的扩展结果。
+  string extensions_json = 4;
+}
+
+
+
+message RegisterRequest {
+  // Gateway 可以访问的地址，例如 "10.0.0.8:50061"。
+  string endpoint = 1;
+  // 当前 Server 提供的模型名称，例如 "pi05".
+  string model_name = 2;
+}
+message RegisterResponse {
+  // Gateway 是否接受注册。
+  bool accepted = 1;
+  // Model Server 实例唯一标识，进程生命周期内保持不变。
+  string server_id = 2;
+  // Gateway 期望的心跳间隔。
+  uint32 heartbeat_interval_seconds = 3;
+  // 注册失败原因；成功时为空。
+  string message = 4;
+}
+message HeartbeatRequest {
+  // 必须与 Register 时的 server_id 一致。
+  string server_id = 1;
+}
+message HeartbeatResponse {
+  // Gateway 是否仍然识别该 Server。
+  // false 时，Model Server 应重新 Register。
+  bool registered = 1;
+  string message = 2;
+}
