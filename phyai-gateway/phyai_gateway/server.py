@@ -51,7 +51,7 @@ def main():
         model_client.close()
         raise RuntimeError(f"failed to bind Gateway to {args.gateway}")
 
-    http_server = HTTPServer(args.http_host, args.http_port)
+    http_server = HTTPServer(args.http_host, args.http_port, model_client)
     http_server.start()
 
     shutdown_lock = threading.Lock()
