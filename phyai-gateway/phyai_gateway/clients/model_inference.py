@@ -5,7 +5,8 @@ import grpc
 
 from phyai_gateway.bindings import model_inference_pb2_grpc
 
-INFERENCE_TIMEOUT_SECONDS = 5
+INFERENCE_TIMEOUT_SECONDS = 600
+MAX_MESSAGE_BYTES = 100 * 1024 * 1024
 
 
 class NoHealthyModelServerError(Exception):
@@ -33,7 +34,13 @@ class ModelInferenceClient:
                     raise RuntimeError("ModelInferenceClient is closed")
                 stub = self._stubs.get(selected.endpoint)
                 if stub is None:
-                    channel = grpc.insecure_channel(selected.endpoint)
+                    channel = grpc.insecure_channel(
+                        selected.endpoint,
+                        options=[
+                            ("grpc.max_send_message_length", MAX_MESSAGE_BYTES),
+                            ("grpc.max_receive_message_length", MAX_MESSAGE_BYTES),
+                        ],
+                    )
                     stub = model_inference_pb2_grpc.ModelInferenceStub(channel)
                     self._channels[selected.endpoint] = channel
                     self._stubs[selected.endpoint] = stub

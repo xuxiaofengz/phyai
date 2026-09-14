@@ -93,22 +93,14 @@ class RLinfAdapter:
             raise RLinfWireError("invalid MessagePack request") from error
 
         data = self._validate_payload(payload)
-        actions = []
-        action_dim = None
-        received_ns = time.time_ns()
-        for sample_index in range(data["batch_size"]):
-            request = self._build_request(data, sample_index, received_ns)
-            response, _ = self._model_client.infer(request, data["model_name"])
-            sample = self._decode_actions(response, request.request_id, data["horizon"])
-            if action_dim is None:
-                action_dim = sample.shape[1]
-            elif sample.shape[1] != action_dim:
-                raise RLinfBackendResponseError(
-                    "Model Server returned inconsistent action dimensions"
-                )
-            actions.append(sample)
-
-        batch = np.ascontiguousarray(np.stack(actions), dtype="<f4")
+        request = self._build_request(data, time.time_ns())
+        response, _ = self._model_client.infer(request, data["model_name"])
+        batch = self._decode_actions(
+            response,
+            request.request_id,
+            data["batch_size"],
+            data["horizon"],
+        )
         return msgpack.packb(
             {"actions": batch}, default=_pack_numpy, use_bin_type=True
         )
@@ -217,14 +209,14 @@ class RLinfAdapter:
         return images
 
     @staticmethod
-    def _build_request(data, sample_index, received_ns):
-        request_id = f"rlinf-{uuid.uuid4().hex}-{sample_index}"
+    def _build_request(data, received_ns):
+        request_id = f"rlinf-{uuid.uuid4().hex}"
         images = []
         for image_name, batch in (
             ("agentview", data["main_images"]),
             ("robot0_eye_in_hand", data["wrist_images"]),
         ):
-            image = np.ascontiguousarray(batch[sample_index])
+            image = np.ascontiguousarray(batch)
             images.append(
                 model_inference_pb2.Image(
                     name=image_name,
@@ -236,14 +228,8 @@ class RLinfAdapter:
                 )
             )
 
-        state = data["states"][sample_index]
-        if state.dtype == np.float32:
-            state = np.ascontiguousarray(state, dtype="<f4")
-            state_dtype = model_inference_pb2.DATA_TYPE_FLOAT32
-        else:
-            state = np.ascontiguousarray(state, dtype="<f8")
-            state_dtype = model_inference_pb2.DATA_TYPE_FLOAT64
-        extensions = {**data["metadata"], "sample_index": sample_index}
+        state = np.ascontiguousarray(data["states"], dtype="<f4")
+        extensions = {**data["metadata"], "instructions": list(data["tasks"])}
         return model_inference_pb2.InferenceRequest(
             request_id=request_id,
             timestamp_ns=received_ns,
@@ -251,15 +237,15 @@ class RLinfAdapter:
             robot_state=model_inference_pb2.Tensor(
                 data=state.tobytes(order="C"),
                 shape=list(state.shape),
-                dtype=state_dtype,
+                dtype=model_inference_pb2.DATA_TYPE_FLOAT32,
             ),
-            instruction=data["tasks"][sample_index],
+            instruction=data["tasks"][0],
             requested_action_horizon=data["horizon"],
             extensions_json=json.dumps(extensions, separators=(",", ":")),
         )
 
     @staticmethod
-    def _decode_actions(response, request_id, horizon):
+    def _decode_actions(response, request_id, batch_size, horizon):
         if response.request_id != request_id:
             raise RLinfBackendResponseError(
                 "Model Server response request_id does not match request"
@@ -268,12 +254,13 @@ class RLinfAdapter:
         if tensor.dtype != model_inference_pb2.DATA_TYPE_FLOAT32:
             raise RLinfBackendResponseError("Model Server actions must use FLOAT32")
         if (
-            len(tensor.shape) != 2
-            or tensor.shape[0] != horizon
-            or tensor.shape[1] <= 0
+            len(tensor.shape) != 3
+            or tensor.shape[0] != batch_size
+            or tensor.shape[1] != horizon
+            or tensor.shape[2] <= 0
         ):
             raise RLinfBackendResponseError(
-                "Model Server actions must have shape [requested_horizon, action_dim]"
+                "Model Server actions must have shape [batch, requested_horizon, action_dim]"
             )
         if len(tensor.data) != math.prod(tensor.shape) * 4:
             raise RLinfBackendResponseError(

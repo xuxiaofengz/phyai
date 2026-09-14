@@ -1,0 +1,554 @@
+import json
+import threading
+from concurrent import futures
+from pathlib import Path
+import logging
+import time
+
+import grpc
+import numpy as np
+import torch
+
+import phyai_gateway.bindings.model_inference_pb2 as model_inference_pb2
+import phyai_gateway.bindings.model_inference_pb2_grpc as model_inference_pb2_grpc
+
+# import model_inference_pb2
+# import model_inference_pb2_grpc
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.pi05.configuration_pi05 import PI05Config
+from phyai.models.pi05.main_pi05 import PI05Args
+from phyai.models.pi05.scheduler_pi05 import PI05Request
+from phyai.utils import load_config
+from phyai_utils_tools.models.pi05 import PI05Processor
+from phyai_utils_tools.tokenizer import get_tokenizer
+import os
+
+CHECKPOINT_DIR = Path("/data/share/pi05_libero_finetuned_v044")
+TOKENIZER_DIR = Path("/data/share/paligemma-3b-pt-224")
+LISTEN_ADDRESS = "[::]:50063"
+
+GATEWAY_REGISTRY_ADDRESS = "127.0.0.1:50052"
+ADVERTISED_ENDPOINT = "127.0.0.1:50063"
+MODEL_NAME = "pi05"
+REGISTRATION_RETRY_SECONDS = 5
+
+CUDA_VISIBLE_DEVICES=4
+
+
+IMAGE_NAMES = ("agentview", "robot0_eye_in_hand")
+IMAGE_SHAPE = (360, 360, 3)
+STATE_SHAPE = (8,)
+ACTION_DIM = 7
+MAX_BATCH_SIZE = int(os.environ.get("PI05_MAX_BATCH_SIZE", "32"))
+if MAX_BATCH_SIZE < 1:
+    raise ValueError("PI05_MAX_BATCH_SIZE must be at least 1")
+
+
+def remap_lerobot_weight(key):
+    key = key.removeprefix("model.")
+    if key == "paligemma_with_expert.gemma_expert.lm_head.weight":
+        return None
+    return key
+
+
+class ModelRegistryReporter:
+    def __init__(
+        self,
+        registry_address,
+        endpoint,
+        model_name,
+    ):
+        self.endpoint = endpoint
+        self.model_name = model_name
+        self.channel = grpc.insecure_channel(registry_address)
+        self.stub = model_inference_pb2_grpc.ModelRegistryStub(
+            self.channel
+        )
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run,
+            name="model-registry-reporter",
+            daemon=True,
+        )
+    def start(self):
+        self.thread.start()
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join(timeout=4)
+        self.channel.close()
+    def _register(self):
+        response = self.stub.Register(
+            model_inference_pb2.RegisterRequest(
+                endpoint=self.endpoint,
+                model_name=self.model_name,
+            ),
+            timeout=3,
+        )
+        if not response.accepted:
+            logging.warning(
+                "Model Server registration rejected: %s",
+                response.message,
+            )
+            return None
+        if not response.server_id:
+            logging.warning(
+                "Gateway accepted registration without server_id"
+            )
+            return None
+        heartbeat_interval = max(
+            1,
+            response.heartbeat_interval_seconds,
+        )
+        logging.info(
+            "Registered with Gateway: server_id=%s, "
+            "heartbeat_interval=%ss",
+            response.server_id,
+            heartbeat_interval,
+        )
+        return response.server_id, heartbeat_interval
+    def _run(self):
+        registration = None
+        while not self.stop_event.is_set():
+            if registration is None:
+                try:
+                    registration = self._register()
+                except grpc.RpcError as error:
+                    logging.warning(
+                        "Model Server registration failed: %s: %s",
+                        error.code(),
+                        error.details(),
+                    )
+                if registration is None:
+                    self.stop_event.wait(
+                        REGISTRATION_RETRY_SECONDS
+                    )
+                    continue
+            server_id, heartbeat_interval = registration
+            if self.stop_event.wait(heartbeat_interval):
+                return
+            try:
+                response = self.stub.Heartbeat(
+                    model_inference_pb2.HeartbeatRequest(
+                        server_id=server_id,
+                    ),
+                    timeout=3,
+                )
+            except grpc.RpcError as error:
+                logging.warning(
+                    "Model Server heartbeat failed: %s: %s",
+                    error.code(),
+                    error.details(),
+                )
+                continue
+            if response.registered:
+                continue
+            logging.warning(
+                "Gateway no longer recognizes server_id=%s: %s; "
+                "registering again",
+                server_id,
+                response.message,
+            )
+            registration = None
+
+
+
+class PI05Runtime:
+    def __init__(self):
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required for PI0.5 inference")
+
+        self.device = torch.device("cuda")
+        self.dtype = torch.bfloat16
+        self.config = load_config(CHECKPOINT_DIR, PI05Config)
+        self.engine = None
+
+        logging.info("Loading PI0.5 checkpoint from %s", CHECKPOINT_DIR)
+        tokenizer = get_tokenizer(
+            str(TOKENIZER_DIR),
+            local_files_only=True,
+        )
+        self.processor = PI05Processor.from_pretrained(
+            CHECKPOINT_DIR,
+            tokenizer=tokenizer,
+            tokenizer_name=str(TOKENIZER_DIR),
+            image_size=self.config.vision.image_size,
+            num_channels=self.config.vision.num_channels,
+            num_images=len(IMAGE_NAMES),
+            action_dim=ACTION_DIM,
+            normalize_pixels=True,
+            device=self.device,
+            params_dtype=self.dtype,
+            local_files_only=True,
+        )
+        self.engine = Engine(
+            EngineArgs(
+                plugin="pi05",
+                plugin_args=PI05Args(
+                    checkpoint_dir=CHECKPOINT_DIR,
+                    max_batch_size=MAX_BATCH_SIZE,
+                    weight_remap=remap_lerobot_weight,
+                    inputs_image_shape=[
+                        list(IMAGE_SHAPE)
+                        for _ in IMAGE_NAMES
+                    ],
+                ),
+                config=EngineConfig(
+                    device=DeviceConfig(target="cuda", params_dtype=self.dtype),
+                    runtime=RuntimeConfig(use_cuda_graph=True,flashinfer_workspace_bytes=2 * 1024**3),
+                ),
+            )
+        )
+        self._warm_up()
+        logging.info("PI0.5 runtime is ready")
+
+    def _make_request(self, images, state, instructions):
+        processed = self.processor.preprocess(
+            {
+                "images": images,
+                "task": instructions,
+                "state": state,
+            }
+        )
+        return PI05Request(
+            pixel_values=processed.pixel_values.to(
+                device=self.device, dtype=self.dtype
+            ),
+            input_ids=processed.input_ids.to(self.device),
+            lang_lens=processed.lang_lens.to(self.device),
+        )
+
+    def _warm_up(self):
+        logging.info("Warming up PI0.5 inference path")
+        images = [
+            torch.zeros(
+                1,
+                IMAGE_SHAPE[2],
+                IMAGE_SHAPE[0],
+                IMAGE_SHAPE[1],
+                dtype=torch.float32,
+            )
+            for _ in IMAGE_NAMES
+        ]
+        state = torch.zeros(
+            1, STATE_SHAPE[0], dtype=torch.float32
+        )
+        request = self._make_request(images, state, ["warm up"])
+        actions = self.engine.step(request)
+        self.processor.postprocess(actions[..., :ACTION_DIM])
+        torch.cuda.synchronize()
+
+    def infer(self, images, state, instructions, horizon):
+        request = self._make_request(images, state, instructions)
+        torch.cuda.synchronize()
+        start_ns = time.perf_counter_ns()
+        actions = self.engine.step(request)
+        torch.cuda.synchronize()
+        inference_time_us = (time.perf_counter_ns() - start_ns) // 1000
+
+        actions = self.processor.postprocess(actions[..., :ACTION_DIM])
+        batch_size = state.shape[0]
+        if (
+            actions.ndim != 3
+            or actions.shape[0] != batch_size
+            or actions.shape[2] != ACTION_DIM
+        ):
+            raise RuntimeError(
+                f"unexpected PI0.5 action shape: {tuple(actions.shape)}"
+            )
+        if actions.shape[1] < horizon:
+            raise RuntimeError(
+                f"PI0.5 returned horizon {actions.shape[1]}, requested {horizon}"
+            )
+
+        actions = actions[:, :horizon].to(dtype=torch.float32).contiguous().cpu()
+        if not torch.isfinite(actions).all():
+            raise RuntimeError("PI0.5 returned non-finite actions")
+        return actions, inference_time_us
+
+    def close(self):
+        if self.engine is not None:
+            self.engine.close()
+            self.engine = None
+
+
+class ModelInferenceServicer(model_inference_pb2_grpc.ModelInferenceServicer):
+    def __init__(self, runtime):
+        self.runtime = runtime
+
+    def Infer(self, request, context):
+        infer_start=time.perf_counter()
+        images, state, instructions, is_batch = self._validate_and_decode(
+            request,
+            context,
+            self.runtime.config.chunk_size,
+        )
+
+        print('*'*28)
+        print(f'{images[0].shape}')
+        print('*'*28)
+        if not context.is_active():
+            context.abort(grpc.StatusCode.CANCELLED, "request was cancelled")
+
+        logging.info(
+            "request_id=%s image_shapes=%s robot_state_shape=%s instructions=%r",
+            request.request_id,
+            {
+                image.name: list(image.shape)
+                for image in request.images
+            },
+            list(request.robot_state.shape),
+            instructions,
+        )
+
+        try:
+            actions, inference_time_us = self.runtime.infer(
+                images,
+                state,
+                instructions,
+                request.requested_action_horizon,
+            )
+        except torch.cuda.OutOfMemoryError:
+            logging.exception("CUDA out of memory for request %s", request.request_id)
+            context.abort(
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                "PI0.5 inference ran out of GPU memory",
+            )
+        except Exception:
+            logging.exception("PI0.5 inference failed for request %s", request.request_id)
+            context.abort(grpc.StatusCode.INTERNAL, "PI0.5 inference failed")
+
+        if not is_batch:
+            actions = actions[0]
+        action_array = actions.numpy().astype("<f4", copy=False)
+        logging.info(
+            "request_id=%s action_shape=%s inference_time_us_ms=%d",
+            request.request_id,
+            list(action_array.shape),
+            inference_time_us/1000.0,
+        )
+
+        model_server_total_ms=(time.perf_counter()-infer_start)*1000
+        logging.info("model_server_total_ms=[%f]",model_server_total_ms)
+        return model_inference_pb2.InferenceResponse(
+            request_id=request.request_id,
+            actions=model_inference_pb2.Tensor(
+                data=action_array.tobytes(order="C"),
+                shape=list(action_array.shape),
+                dtype=model_inference_pb2.DATA_TYPE_FLOAT32,
+            ),
+            inference_time_us=inference_time_us,
+        )
+
+    @staticmethod
+    def _validate_and_decode(request, context, max_action_horizon):
+        if not request.request_id:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "request_id is required")
+        if len(request.images) != len(IMAGE_NAMES):
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"exactly {len(IMAGE_NAMES)} images are required",
+            )
+        if not 1 <= request.requested_action_horizon <= max_action_horizon:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"requested_action_horizon must be between 1 and {max_action_horizon}",
+            )
+
+        images_by_name = {}
+        batch_size = None
+        is_batch = None
+        for image in request.images:
+            if image.name not in IMAGE_NAMES:
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"unknown image name: {image.name!r}",
+                )
+            if image.name in images_by_name:
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"duplicate image name: {image.name!r}",
+                )
+            if image.dtype != model_inference_pb2.DATA_TYPE_UINT8:
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"image {image.name!r} dtype must be UINT8",
+                )
+            if image.encoding != model_inference_pb2.IMAGE_ENCODING_RAW:
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"image {image.name!r} encoding must be RAW",
+                )
+            if image.layout != model_inference_pb2.IMAGE_LAYOUT_HWC:
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"image {image.name!r} layout must be HWC",
+                )
+
+            image_shape = tuple(image.shape)
+            if image_shape == IMAGE_SHAPE:
+                image_is_batch = False
+                image_batch_size = 1
+            elif len(image_shape) == 4 and image_shape[1:] == IMAGE_SHAPE:
+                image_is_batch = True
+                image_batch_size = image_shape[0]
+                if not 1 <= image_batch_size <= MAX_BATCH_SIZE:
+                    context.abort(
+                        grpc.StatusCode.INVALID_ARGUMENT,
+                        f"image batch size must be between 1 and {MAX_BATCH_SIZE}",
+                    )
+            else:
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"image {image.name!r} shape must be {list(IMAGE_SHAPE)} "
+                    f"or [B, {IMAGE_SHAPE[0]}, {IMAGE_SHAPE[1]}, {IMAGE_SHAPE[2]}]",
+                )
+
+            if is_batch is None:
+                is_batch = image_is_batch
+                batch_size = image_batch_size
+            elif is_batch != image_is_batch or batch_size != image_batch_size:
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    "all images must use the same batch shape",
+                )
+            if len(image.data) != int(np.prod(image_shape)):
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"image {image.name!r} data length does not match its shape",
+                )
+            images_by_name[image.name] = image
+
+        if is_batch:
+            try:
+                extensions = json.loads(request.extensions_json)
+            except (TypeError, ValueError):
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    "extensions_json must be valid JSON for batch inference",
+                )
+            if not isinstance(extensions, dict):
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    "extensions_json must be a JSON object for batch inference",
+                )
+            instructions = extensions.get("instructions")
+            if (
+                not isinstance(instructions, list)
+                or len(instructions) != batch_size
+                or any(
+                    not isinstance(instruction, str) or not instruction.strip()
+                    for instruction in instructions
+                )
+            ):
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"extensions_json.instructions must contain exactly {batch_size} "
+                    "non-empty strings",
+                )
+        else:
+            if not request.instruction.strip():
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    "instruction is required",
+                )
+            instructions = [request.instruction]
+
+        robot_state = request.robot_state
+        if robot_state.dtype != model_inference_pb2.DATA_TYPE_FLOAT32:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "robot_state dtype must be FLOAT32",
+            )
+        expected_state_shape = (
+            (batch_size, *STATE_SHAPE) if is_batch else STATE_SHAPE
+        )
+        if tuple(robot_state.shape) != expected_state_shape:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"robot_state shape must be {list(expected_state_shape)}",
+            )
+        if len(robot_state.data) != int(np.prod(expected_state_shape)) * 4:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "robot_state data length does not match its shape",
+            )
+
+        image_tensors = []
+        for image_name in IMAGE_NAMES:
+            image = images_by_name[image_name]
+            image_array = np.frombuffer(
+                image.data,
+                dtype=np.uint8,
+            ).reshape(tuple(image.shape)).copy()
+            if not is_batch:
+                image_array = np.expand_dims(image_array, axis=0)
+            image_tensors.append(
+                torch.from_numpy(image_array)
+                .permute(0, 3, 1, 2)
+                .to(dtype=torch.float32)
+                .div_(255.0)
+            )
+
+        state_array = np.frombuffer(robot_state.data, dtype="<f4").copy()
+        if not np.isfinite(state_array).all():
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "robot_state must contain finite values",
+            )
+        state_tensor = torch.from_numpy(state_array).reshape(batch_size, *STATE_SHAPE)
+        return image_tensors, state_tensor, instructions, is_batch
+
+
+def serve():
+    os.environ["CUDA_VISIBLE_DEVICES"]="1"
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    runtime = PI05Runtime()
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=8),
+        options=[
+            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+            ("grpc.max_send_message_length", 100 * 1024 * 1024),
+        ],
+    )
+    model_inference_pb2_grpc.add_ModelInferenceServicer_to_server(
+        ModelInferenceServicer(runtime),
+        server,
+    )
+    server.add_insecure_port(LISTEN_ADDRESS)
+
+    registry_reporter = ModelRegistryReporter(
+        registry_address=GATEWAY_REGISTRY_ADDRESS,
+        endpoint=ADVERTISED_ENDPOINT,
+        model_name=MODEL_NAME,
+    )
+
+    server.start()
+    logging.info("PI0.5 ModelInference Server listening on %s", LISTEN_ADDRESS)
+    
+    registry_reporter.start()
+    logging.info("registry_reporter started")
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        logging.info("Stopping PI0.5 ModelInference Server")
+        
+    finally:
+        registry_reporter.stop()
+        server.stop(grace=2).wait()
+        runtime.close()
+
+
+if __name__ == "__main__":
+    serve()
+
+
+"""
+CUDA_VISIBLE_DEVICES=4 \
+/phyai_workspace/phyai-old/.venv/bin/python
+
+"""

@@ -142,7 +142,8 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        required=True,
+        # required=True,
+        default=Path("/data/share/pi05_base"),
         help=(
             "pi05_base checkpoint: a local folder, or a HuggingFace repo id "
             "(downloaded on first use). Must contain config.json and either "
