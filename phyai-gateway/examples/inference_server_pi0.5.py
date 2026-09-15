@@ -284,9 +284,9 @@ class ModelInferenceServicer(model_inference_pb2_grpc.ModelInferenceServicer):
             self.runtime.config.chunk_size,
         )
 
-        print('*'*28)
-        print(f'{images[0].shape}')
-        print('*'*28)
+        # print('*'*28)
+        # print(f'{images[0].shape}')
+        # print('*'*28)
         if not context.is_active():
             context.abort(grpc.StatusCode.CANCELLED, "request was cancelled")
 
@@ -500,8 +500,19 @@ class ModelInferenceServicer(model_inference_pb2_grpc.ModelInferenceServicer):
         return image_tensors, state_tensor, instructions, is_batch
 
 
-def serve():
-    os.environ["CUDA_VISIBLE_DEVICES"]="1"
+def serve(
+    port: int | None = None,
+    listen: str | None = None,
+    advertised_endpoint: str | None = None,
+    gateway_registry: str = GATEWAY_REGISTRY_ADDRESS,
+):
+    if port is not None:
+        if listen is not None:
+            raise ValueError("use either --port or --listen, not both")
+        listen = f"[::]:{port}"
+        advertised_endpoint = advertised_endpoint or f"127.0.0.1:{port}"
+    listen = listen or LISTEN_ADDRESS
+    advertised_endpoint = advertised_endpoint or ADVERTISED_ENDPOINT
     
     logging.basicConfig(
         level=logging.INFO,
@@ -519,16 +530,16 @@ def serve():
         ModelInferenceServicer(runtime),
         server,
     )
-    server.add_insecure_port(LISTEN_ADDRESS)
+    server.add_insecure_port(listen)
 
     registry_reporter = ModelRegistryReporter(
-        registry_address=GATEWAY_REGISTRY_ADDRESS,
-        endpoint=ADVERTISED_ENDPOINT,
+        registry_address=gateway_registry,
+        endpoint=advertised_endpoint,
         model_name=MODEL_NAME,
     )
 
     server.start()
-    logging.info("PI0.5 ModelInference Server listening on %s", LISTEN_ADDRESS)
+    logging.info("PI0.5 ModelInference Server listening on %s", listen)
     
     registry_reporter.start()
     logging.info("registry_reporter started")
@@ -543,8 +554,43 @@ def serve():
         runtime.close()
 
 
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="PI0.5 gRPC Model Server"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Listen port, for example 30000",
+    )
+    parser.add_argument(
+        "--listen",
+        default=None,
+        help="Full gRPC listen address, for example [::]:50063",
+    )
+    parser.add_argument(
+        "--advertised-endpoint",
+        default=None,
+        help="Endpoint registered in Gateway, for example 127.0.0.1:30000",
+    )
+    parser.add_argument(
+        "--gateway-registry",
+        default=GATEWAY_REGISTRY_ADDRESS,
+    )
+    args = parser.parse_args()
+    if args.port is not None and args.port < 1:
+        parser.error("--port must be positive")
+    serve(
+        port=args.port,
+        listen=args.listen,
+        advertised_endpoint=args.advertised_endpoint,
+        gateway_registry=args.gateway_registry,
+    )
+
 if __name__ == "__main__":
-    serve()
+    main()
 
 
 """
