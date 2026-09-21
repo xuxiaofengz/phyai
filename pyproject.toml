@@ -24,12 +24,6 @@ package = false
 [tool.uv.workspace]
 members = ["phyai", "phyai-kernel", "phyai-ext", "phyai-model-optimizer", "phyai-utils-tools", "phyai-gateway"]
 
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
 [tool.uv.sources]
 phyai = { workspace = true }
 phyai-kernel = { workspace = true }
@@ -37,8 +31,6 @@ phyai-ext = { workspace = true }
 phyai-model-optimizer = { workspace = true }
 phyai-utils-tools = { workspace = true }
 phyai-gateway = { workspace = true }
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
 
 [dependency-groups]
 dev = [
