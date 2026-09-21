@@ -24,6 +24,7 @@ from phyai_utils_tools.models.pi05 import PI05Processor
 from phyai_utils_tools.tokenizer import get_tokenizer
 import os
 
+
 # CHECKPOINT_DIR = Path("/data/share/models/pi05_libero_finetuned_v044")
 CHECKPOINT_DIR = Path("/data/share/models/pi05_libero_base")
 TOKENIZER_DIR = Path("/data/share/models/paligemma-3b-pt-224")
@@ -323,7 +324,7 @@ class ModelInferenceServicer(model_inference_pb2_grpc.ModelInferenceServicer):
             actions = actions[0]
         action_array = actions.numpy().astype("<f4", copy=False)
         logging.info(
-            "request_id=%s action_shape=%s inference_time_us_ms=%d",
+            "request_id=%s action_shape=%s inference_time_us_ms=%d ms",
             request.request_id,
             list(action_array.shape),
             inference_time_us/1000.0,
