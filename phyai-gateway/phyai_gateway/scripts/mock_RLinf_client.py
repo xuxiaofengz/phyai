@@ -59,7 +59,7 @@ def unpack_numpy(value: Any) -> Any:
         data,
         dtype=dtype,
     ).reshape(shape)
-def build_body(
+def build_gateway_body(
     batch_size: int,
     height: int,
     width: int,
@@ -100,8 +100,54 @@ def build_body(
         default=pack_numpy,
         use_bin_type=True,
     )
+
+
+def build_sglang_body(
+    height: int,
+    width: int,
+    state_dim: int,
+    horizon: int,
+) -> bytes:
+    image = np.zeros(
+        (height, width, 3),
+        dtype=np.uint8,
+    )
+    payload = {
+        "model": "pi05",
+        "input": {
+            "task": "pick up the object",
+            "observation": {
+                "images": {
+                    "image": image.tolist(),
+                    "image2": image.tolist(),
+                },
+                "state": np.zeros(
+                    state_dim,
+                    dtype=np.float32,
+                ).tolist(),
+            },
+        },
+        "parameters": {
+            "action_horizon": horizon,
+            "action_dim": 32,
+            "num_inference_steps": 10,
+        },
+        "runtime": {
+            "response_format": "envelope",
+            "output_format": "numpy",
+            "return_timing": True,
+            "cuda_graph": False,
+        },
+    }
+    return msgpack.packb(
+        payload,
+        use_bin_type=True,
+    )
+
+
 def validate_response(
     response: httpx.Response,
+    target: str,
     batch_size: int,
     horizon: int,
 ) -> None:
@@ -111,28 +157,63 @@ def validate_response(
         raw=False,
         object_hook=unpack_numpy,
     )
-    actions = (
-        decoded.get("actions")
-        if isinstance(decoded, dict)
-        else None
+    if target == "gateway":
+        actions = (
+            decoded.get("actions")
+            if isinstance(decoded, dict)
+            else None
+        )
+        if not isinstance(actions, np.ndarray):
+            raise ValueError(
+                "Gateway response does not contain NumPy actions"
+            )
+        if (
+            actions.ndim != 3
+            or actions.shape[0] != batch_size
+            or actions.shape[1] != horizon
+        ):
+            raise ValueError(
+                f"Gateway returned action shape {actions.shape}; "
+                f"expected [{batch_size}, {horizon}, action_dim]"
+            )
+        return
+    try:
+        action = decoded["data"][0]["action"]
+        values = action["values"]
+        declared_shape = tuple(action["shape"])
+    except (
+        KeyError,
+        IndexError,
+        TypeError,
+    ) as exc:
+        raise ValueError(
+            "SGLang response does not contain envelope action"
+        ) from exc
+    actual_shape = (
+        tuple(values.shape)
+        if isinstance(values, np.ndarray)
+        else tuple(np.asarray(values).shape)
     )
-    if not isinstance(actions, np.ndarray):
+    if actual_shape != declared_shape:
         raise ValueError(
-            "response does not contain NumPy actions"
+            f"SGLang values shape {actual_shape} "
+            f"does not match declared shape {declared_shape}"
         )
-    if (
-        actions.ndim != 3
-        or actions.shape[0] != batch_size
-        or actions.shape[1] != horizon
-    ):
+    if len(declared_shape) != 2:
         raise ValueError(
-            f"unexpected action shape {actions.shape}; "
-            f"expected [{batch_size}, {horizon}, action_dim]"
+            f"SGLang action must be rank 2, got {declared_shape}"
         )
+    if declared_shape[0] < horizon:
+        raise ValueError(
+            f"SGLang returned horizon {declared_shape[0]}, "
+            f"requested at least {horizon}"
+        )
+
 async def send_one(
     client: httpx.AsyncClient,
     url: str,
     body: bytes,
+    target: str,
     batch_size: int,
     horizon: int,
 ) -> Result:
@@ -143,10 +224,12 @@ async def send_one(
             content=body,
             headers={
                 "content-type": "application/msgpack",
+                "accept": "application/msgpack",
             },
         )
         validate_response(
             response,
+            target,
             batch_size,
             horizon,
         )
@@ -164,6 +247,7 @@ async def run_phase(
     client: httpx.AsyncClient,
     url: str,
     body: bytes,
+    target: str,
     batch_size: int,
     horizon: int,
     concurrency: int,
@@ -185,6 +269,7 @@ async def run_phase(
                         client,
                         url,
                         body,
+                        target,
                         batch_size,
                         horizon,
                     )
@@ -274,22 +359,41 @@ def print_summary(
         for error, count in error_counts.most_common(10):
             print(f"    {count}x {error}")
 async def main(args: argparse.Namespace) -> None:
+    if args.target == "sglang" and args.batch_size != 1:
+        raise SystemExit(
+            "--batch-size must be 1 when --target sglang"
+        )
+    if args.url is not None:
+        base_url = args.url
+    elif args.target == "gateway":
+        base_url = args.gateway
+    else:
+        base_url = args.sglang
     url = (
-        args.gateway.rstrip("/")
+        base_url.rstrip("/")
         + "/v1/actions/generations"
     )
-    body = build_body(
-        batch_size=args.batch_size,
-        height=args.height,
-        width=args.width,
-        state_dim=args.state_dim,
-        horizon=args.horizon,
-    )
+    if args.target == "gateway":
+        body = build_gateway_body(
+            batch_size=args.batch_size,
+            height=args.height,
+            width=args.width,
+            state_dim=args.state_dim,
+            horizon=args.horizon,
+        )
+    else:
+        body = build_sglang_body(
+            height=args.height,
+            width=args.width,
+            state_dim=args.state_dim,
+            horizon=args.horizon,
+        )
     limits = httpx.Limits(
         max_connections=args.concurrency,
         max_keepalive_connections=args.concurrency,
     )
-    print(f"gateway: {url}")
+    print(f"target: {args.target}")
+    print(f"endpoint: {url}")
     print(f"payload bytes: {len(body)}")
     print(f"batch size: {args.batch_size}")
     print(f"concurrency: {args.concurrency}")
@@ -305,6 +409,7 @@ async def main(args: argparse.Namespace) -> None:
                 client=client,
                 url=url,
                 body=body,
+                target=args.target,
                 batch_size=args.batch_size,
                 horizon=args.horizon,
                 concurrency=args.concurrency,
@@ -316,6 +421,7 @@ async def main(args: argparse.Namespace) -> None:
             client=client,
             url=url,
             body=body,
+            target=args.target,
             batch_size=args.batch_size,
             horizon=args.horizon,
             concurrency=args.concurrency,
@@ -332,14 +438,30 @@ def parse_args() -> argparse.Namespace:
         description=__doc__
     )
     parser.add_argument(
+        "--target",
+        choices=("gateway", "sglang"),
+        default="gateway",
+        help="Target service to load-test",
+    )
+    parser.add_argument(
+        "--url",
+        default=None,
+        help="Override target base URL",
+    )
+    parser.add_argument(
         "--gateway",
         default="http://127.0.0.1:30000",
         help="Gateway base URL",
     )
     parser.add_argument(
+        "--sglang",
+        default="http://127.0.0.1:30001",
+        help="SGLang base URL",
+    )
+    parser.add_argument(
         "--duration",
         type=float,
-        default=120.0,
+        default=60.0,
         help="Measured duration in seconds",
     )
     parser.add_argument(
@@ -358,7 +480,7 @@ def parse_args() -> argparse.Namespace:
         "--batch-size",
         type=int,
         default=1,
-        help="RLinf batch size",
+        help="Gateway RLinf batch size",
     )
     parser.add_argument(
         "--height",
@@ -403,10 +525,41 @@ def parse_args() -> argparse.Namespace:
         or args.timeout <= 0
     ):
         parser.error(
-            "duration, concurrency, batch size, image dimensions, "
-            "state dimension, horizon, and timeout must be positive; "
+            "durations, concurrency, sizes, dimensions, "
+            "horizon, and timeout must be positive; "
             "warmup must be non-negative"
         )
     return args
+
 if __name__ == "__main__":
     asyncio.run(main(parse_args()))
+
+
+"""
+
+运行 Gateway 压测
+
+  /data/xuxiaofeng/phyai_workspace/RLinf/.venv/bin/python \
+    /data/xuxiaofeng/phyai_workspace/phyai/phyai-gateway/phyai_gateway/scripts/mock_RLinf_client.py \
+    --target gateway \
+    --gateway http://127.0.0.1:30000 \
+    --warmup 10 \
+    --duration 120 \
+    --concurrency 32 \
+    --batch-size 1 \
+    --horizon 50 \
+    --timeout 600
+
+  运行 SGLang 压测
+
+  /data/xuxiaofeng/phyai_workspace/RLinf/.venv/bin/python \
+    /data/xuxiaofeng/phyai_workspace/phyai/phyai-gateway/phyai_gateway/scripts/mock_RLinf_client.py \
+    --target sglang \
+    --sglang http://127.0.0.1:31000 \
+    --warmup 10 \
+    --duration 120 \
+    --concurrency 8 \
+    --batch-size 1 \
+    --horizon 50 \
+    --timeout 600
+"""
