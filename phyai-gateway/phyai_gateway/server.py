@@ -19,7 +19,7 @@ INFERENCE_SHUTDOWN_GRACE_SECONDS = 5
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gateway", default="0.0.0.0:50052")
+    parser.add_argument("--gateway", default="0.0.0.0:50111")
     parser.add_argument("--threads", type=int, default=32)
     parser.add_argument("--http-host", default="0.0.0.0")
     parser.add_argument("--http-port", type=int, default=30000)

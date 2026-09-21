@@ -142,8 +142,7 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        # required=True,
-        default=Path("/data/share/pi05_base"),
+        required=True,
         help=(
             "pi05_base checkpoint: a local folder, or a HuggingFace repo id "
             "(downloaded on first use). Must contain config.json and either "
@@ -294,13 +293,6 @@ def main() -> None:
             # Lazy import so --raw runs without phyai_utils_tools / tokenizer load.
             from phyai_utils_tools.models.pi05 import PI05Processor
 
-            from transformers import AutoTokenizer
-
-            tokenizer=AutoTokenizer.from_pretrained(
-                "/data/share/paligemma-3b-pt-224",
-                local_files_only=True,
-            )
-
             processor = PI05Processor(
                 image_size=plugin_cfg.vision.image_size,
                 num_channels=plugin_cfg.vision.num_channels,
@@ -309,7 +301,6 @@ def main() -> None:
                 action_dim=plugin_cfg.max_action_dim,
                 device=request_device,
                 params_dtype=dtype,
-                tokenizer=tokenizer,
             )
             request = make_processed_request(
                 processor,

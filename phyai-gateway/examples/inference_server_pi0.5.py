@@ -24,11 +24,12 @@ from phyai_utils_tools.models.pi05 import PI05Processor
 from phyai_utils_tools.tokenizer import get_tokenizer
 import os
 
-CHECKPOINT_DIR = Path("/data/share/pi05_libero_finetuned_v044")
-TOKENIZER_DIR = Path("/data/share/paligemma-3b-pt-224")
+# CHECKPOINT_DIR = Path("/data/share/models/pi05_libero_finetuned_v044")
+CHECKPOINT_DIR = Path("/data/share/models/pi05_libero_base")
+TOKENIZER_DIR = Path("/data/share/models/paligemma-3b-pt-224")
 LISTEN_ADDRESS = "[::]:50063"
 
-GATEWAY_REGISTRY_ADDRESS = "127.0.0.1:50052"
+GATEWAY_REGISTRY_ADDRESS = "127.0.0.1:50111"
 ADVERTISED_ENDPOINT = "127.0.0.1:50063"
 MODEL_NAME = "pi05"
 REGISTRATION_RETRY_SECONDS = 5
