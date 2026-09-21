@@ -26,8 +26,8 @@ import os
 
 
 # CHECKPOINT_DIR = Path("/data/share/models/pi05_libero_finetuned_v044")
-CHECKPOINT_DIR = Path("/data/share/models/pi05_libero_base")
-TOKENIZER_DIR = Path("/data/share/models/paligemma-3b-pt-224")
+CHECKPOINT_DIR = Path("/data/share/pi05_libero_base")
+TOKENIZER_DIR = Path("/data/share/paligemma-3b-pt-224")
 LISTEN_ADDRESS = "[::]:50063"
 
 GATEWAY_REGISTRY_ADDRESS = "127.0.0.1:50111"

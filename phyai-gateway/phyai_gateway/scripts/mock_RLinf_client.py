@@ -598,19 +598,12 @@ if __name__ == "__main__":
 """
 
 运行 Gateway 压测
-
-<<<<<<< HEAD
   python \
     mock_RLinf_client.py \
-=======
-  /data/xuxiaofeng/phyai_workspace/RLinf/.venv/bin/python \
-    /data/xuxiaofeng/phyai_workspace/phyai/phyai-gateway/phyai_gateway/scripts/mock_RLinf_client.py \
->>>>>>> feature/phyai_gateway
     --target gateway \
     --gateway http://127.0.0.1:30000 \
     --warmup 10 \
-    --duration 120 \
-<<<<<<< HEAD
+    --duration 60 \
     --concurrency 1 \
     --batch-size 1 \
     --horizon 50 \
@@ -620,11 +613,10 @@ python \
     mock_RLinf_client.py \
     --target gateway \
     --mode N-Request \
+    --request_num 16 \
     --gateway http://127.0.0.1:30000 \
     --warmup 10 \
     --duration 120 \
-=======
->>>>>>> feature/phyai_gateway
     --concurrency 32 \
     --batch-size 1 \
     --horizon 50 \
@@ -632,13 +624,9 @@ python \
 
   运行 SGLang 压测
 
-<<<<<<< HEAD
+
 python \
     mock_RLinf_client.py \
-=======
-  /data/xuxiaofeng/phyai_workspace/RLinf/.venv/bin/python \
-    /data/xuxiaofeng/phyai_workspace/phyai/phyai-gateway/phyai_gateway/scripts/mock_RLinf_client.py \
->>>>>>> feature/phyai_gateway
     --target sglang \
     --sglang http://127.0.0.1:31000 \
     --warmup 10 \
@@ -647,7 +635,6 @@ python \
     --batch-size 1 \
     --horizon 50 \
     --timeout 600
-<<<<<<< HEAD
 
 python \
     mock_RLinf_client.py \
@@ -666,6 +653,4 @@ sglang serve \
   --model-type diffusion \
   --host 0.0.0.0 \
   --port 31000
-=======
->>>>>>> feature/phyai_gateway
 """

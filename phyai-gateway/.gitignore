@@ -1,4 +1,4 @@
 examples/logs
 outputs
-
-
+__pycache__/
+*.py[cod]
