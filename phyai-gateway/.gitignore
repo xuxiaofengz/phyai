@@ -2,3 +2,4 @@ examples/logs
 outputs
 __pycache__/
 *.py[cod]
+phyai_gateway/scripts/plot_latencies.py
