@@ -25,19 +25,10 @@ from phyai_utils_tools.tokenizer import get_tokenizer
 import os
 
 
-# CHECKPOINT_DIR = Path("/data/share/models/pi05_libero_finetuned_v044")
-CHECKPOINT_DIR = Path("/data/share/pi05_libero_base")
-TOKENIZER_DIR = Path("/data/share/paligemma-3b-pt-224")
-LISTEN_ADDRESS = "[::]:50063"
 
-GATEWAY_REGISTRY_ADDRESS = "127.0.0.1:50111"
-ADVERTISED_ENDPOINT = "127.0.0.1:50063"
+TOKENIZER_DIR = Path("/data/share/paligemma-3b-pt-224")
 MODEL_NAME = "pi05"
 REGISTRATION_RETRY_SECONDS = 5
-
-CUDA_VISIBLE_DEVICES=4
-
-
 IMAGE_NAMES = ("agentview", "robot0_eye_in_hand")
 IMAGE_SHAPE = (360, 360, 3)
 STATE_SHAPE = (8,)
@@ -156,22 +147,22 @@ class ModelRegistryReporter:
 
 
 class PI05Runtime:
-    def __init__(self):
+    def __init__(self,checkpoint_dir):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for PI0.5 inference")
 
         self.device = torch.device("cuda")
         self.dtype = torch.bfloat16
-        self.config = load_config(CHECKPOINT_DIR, PI05Config)
+        self.config = load_config(checkpoint_dir, PI05Config)
         self.engine = None
 
-        logging.info("Loading PI0.5 checkpoint from %s", CHECKPOINT_DIR)
+        logging.info("Loading PI0.5 checkpoint from %s", checkpoint_dir)
         tokenizer = get_tokenizer(
             str(TOKENIZER_DIR),
             local_files_only=True,
         )
         self.processor = PI05Processor.from_pretrained(
-            CHECKPOINT_DIR,
+            checkpoint_dir,
             tokenizer=tokenizer,
             tokenizer_name=str(TOKENIZER_DIR),
             image_size=self.config.vision.image_size,
@@ -187,7 +178,7 @@ class PI05Runtime:
             EngineArgs(
                 plugin="pi05",
                 plugin_args=PI05Args(
-                    checkpoint_dir=CHECKPOINT_DIR,
+                    checkpoint_dir=checkpoint_dir,
                     max_batch_size=MAX_BATCH_SIZE,
                     weight_remap=remap_lerobot_weight,
                     inputs_image_shape=[
@@ -324,7 +315,7 @@ class ModelInferenceServicer(model_inference_pb2_grpc.ModelInferenceServicer):
             actions = actions[0]
         action_array = actions.numpy().astype("<f4", copy=False)
         logging.info(
-            "request_id=%s action_shape=%s inference_time_us_ms=%d ms",
+            "request_id=%s action_shape=%s inference_time_us_ms=%0.3f ms",
             request.request_id,
             list(action_array.shape),
             inference_time_us/1000.0,
@@ -503,24 +494,29 @@ class ModelInferenceServicer(model_inference_pb2_grpc.ModelInferenceServicer):
 
 
 def serve(
+    checkpoint_dir: str | None=None,
     port: int | None = None,
     listen: str | None = None,
     advertised_endpoint: str | None = None,
-    gateway_registry: str = GATEWAY_REGISTRY_ADDRESS,
+    gateway_registry: str | None = None,
 ):
+    if checkpoint_dir is None:
+        raise ValueError("Need checkpoint_dir")
+    if gateway_registry is None:
+        raise ValueError("Need gateway_registry_address")
     if port is not None:
         if listen is not None:
             raise ValueError("use either --port or --listen, not both")
         listen = f"[::]:{port}"
         advertised_endpoint = advertised_endpoint or f"127.0.0.1:{port}"
-    listen = listen or LISTEN_ADDRESS
-    advertised_endpoint = advertised_endpoint or ADVERTISED_ENDPOINT
+    if listen is None:
+        listen = "[::]:50063"
     
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    runtime = PI05Runtime()
+    runtime = PI05Runtime(checkpoint_dir=checkpoint_dir)
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=8),
         options=[
@@ -564,7 +560,7 @@ def main():
     parser.add_argument(
         "--port",
         type=int,
-        default=None,
+        default=50063,
         help="Listen port, for example 30000",
     )
     parser.add_argument(
@@ -579,12 +575,18 @@ def main():
     )
     parser.add_argument(
         "--gateway-registry",
-        default=GATEWAY_REGISTRY_ADDRESS,
+        default="127.0.0.1:50111",
     )
+    parser.add_argument(
+        "--checkpoint-dir",
+        default="/data/share/pi05_libero_finetuned_v044",
+    )
+
     args = parser.parse_args()
     if args.port is not None and args.port < 1:
         parser.error("--port must be positive")
     serve(
+        checkpoint_dir=args.checkpoint_dir,
         port=args.port,
         listen=args.listen,
         advertised_endpoint=args.advertised_endpoint,
@@ -593,10 +595,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-"""
-CUDA_VISIBLE_DEVICES=4 \
-/phyai_workspace/phyai-old/.venv/bin/python
-
-"""
